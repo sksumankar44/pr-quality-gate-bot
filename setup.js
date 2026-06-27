@@ -1,0 +1,250 @@
+// Interactive one-time setup wizard.  Run:  node setup.js
+import readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { execSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ENV_PATH = path.join(__dirname, '.env');
+
+const RESET = '\x1b[0m';
+const BOLD  = '\x1b[1m';
+const GREEN = '\x1b[32m';
+const CYAN  = '\x1b[36m';
+const YELLOW= '\x1b[33m';
+const RED   = '\x1b[31m';
+const DIM   = '\x1b[2m';
+
+const ok  = (msg) => console.log(`${GREEN}✔${RESET}  ${msg}`);
+const info= (msg) => console.log(`${CYAN}ℹ${RESET}  ${msg}`);
+const warn= (msg) => console.log(`${YELLOW}⚠${RESET}  ${msg}`);
+const err = (msg) => console.log(`${RED}✖${RESET}  ${msg}`);
+const hdr = (msg) => console.log(`\n${BOLD}${msg}${RESET}`);
+const dim = (msg) => console.log(`${DIM}${msg}${RESET}`);
+
+// ─── Step 1: Node version check ──────────────────────────────────────────────
+hdr('PR Quality Gate Bot — Setup Wizard');
+console.log('─'.repeat(50));
+
+const [major, minor] = process.versions.node.split('.').map(Number);
+if (major < 18 || (major === 18 && minor < 17)) {
+  err(`Node.js 18.17+ required. You have ${process.versions.node}.`);
+  err('Download: https://nodejs.org');
+  process.exit(1);
+}
+ok(`Node.js ${process.versions.node} detected.`);
+
+// ─── Step 2: npm install (idempotent) ────────────────────────────────────────
+if (!fs.existsSync(path.join(__dirname, 'node_modules', 'express'))) {
+  info('Running npm install …');
+  execSync('npm install --no-audit --no-fund', { stdio: 'inherit', cwd: __dirname });
+  ok('Dependencies installed.');
+} else {
+  ok('Dependencies already installed.');
+}
+
+// ─── Step 3: Decide AI provider ──────────────────────────────────────────────
+hdr('Step 1 of 3 — Choose a FREE AI provider');
+console.log(`
+  ${BOLD}1. Google Gemini${RESET} (recommended)
+     Free tier. Get a key at: ${CYAN}https://aistudio.google.com/app/apikey${RESET}
+     Sign in with Google → "Create API key" → copy it.
+
+  ${BOLD}2. Groq${RESET} (also free, very fast, runs Llama 3.3)
+     Free tier. Get a key at: ${CYAN}https://console.groq.com/keys${RESET}
+     Sign up → "Create API key" → copy it.
+`);
+
+const rl = readline.createInterface({ input, output });
+
+let aiProvider, aiKey, aiModel;
+while (true) {
+  const choice = (await rl.question('  Enter 1 or 2 (default 1): ')).trim() || '1';
+  if (choice === '1') {
+    aiProvider = 'gemini'; aiModel = 'gemini-2.0-flash';
+    break;
+  } else if (choice === '2') {
+    aiProvider = 'groq'; aiModel = 'llama-3.3-70b-versatile';
+    break;
+  }
+  warn('Please enter 1 or 2.');
+}
+
+console.log(`\n  Open the link above and copy your ${BOLD}${aiProvider === 'gemini' ? 'Gemini' : 'Groq'}${RESET} API key.`);
+while (true) {
+  aiKey = (await rl.question(`  Paste your ${aiProvider === 'gemini' ? 'Gemini' : 'Groq'} API key: `)).trim();
+  if (aiKey.length > 10) break;
+  warn('That looks too short. Paste the full key.');
+}
+ok(`AI provider set to ${aiProvider}.`);
+
+// ─── Step 4: GitHub token ────────────────────────────────────────────────────
+hdr('Step 2 of 3 — GitHub personal access token');
+console.log(`
+  The bot needs a token to read your PR diff and post comments.
+
+  ${BOLD}How to create one:${RESET}
+  1. Go to: ${CYAN}https://github.com/settings/tokens${RESET}
+  2. Click "Generate new token (classic)"
+  3. Name it: pr-quality-gate-bot
+  4. Tick the ${BOLD}repo${RESET} scope (full)
+  5. Click "Generate token" → copy the ${BOLD}ghp_...${RESET} value
+`);
+
+let githubToken;
+while (true) {
+  githubToken = (await rl.question('  Paste your GitHub token (ghp_...): ')).trim();
+  if (githubToken.startsWith('ghp_') || githubToken.startsWith('github_pat_')) break;
+  // allow anything, just check it's non-empty
+  if (githubToken.length > 10) break;
+  warn('Token looks too short — paste the full value.');
+}
+ok('GitHub token saved.');
+
+// ─── Step 5: Which GitHub repos? ─────────────────────────────────────────────
+hdr('Step 3 of 3 — GitLab & Jira (optional, skip to continue)');
+console.log(`  ${DIM}Press Enter to skip any field.${RESET}\n`);
+
+const gitlabToken = (await rl.question('  GitLab token (leave blank to skip GitLab): ')).trim();
+const jiraUrl     = (await rl.question('  Jira base URL e.g. https://company.atlassian.net (blank to skip): ')).trim();
+let jiraEmail = '', jiraApiToken = '';
+if (jiraUrl) {
+  jiraEmail    = (await rl.question('  Jira email: ')).trim();
+  jiraApiToken = (await rl.question('  Jira API token: ')).trim();
+}
+const teamsUrl = (await rl.question('  Teams Incoming Webhook URL (blank to skip): ')).trim();
+
+rl.close();
+
+// ─── Step 6: Generate .env ───────────────────────────────────────────────────
+const webhookSecret = crypto.randomBytes(24).toString('hex');
+
+const envLines = [
+  '# Generated by setup.js',
+  `PORT=3000`,
+  `LOG_LEVEL=info`,
+  '',
+  `AI_PROVIDER=${aiProvider}`,
+  `GEMINI_API_KEY=${aiProvider === 'gemini' ? aiKey : ''}`,
+  `GEMINI_MODEL=gemini-2.0-flash`,
+  `GROQ_API_KEY=${aiProvider === 'groq' ? aiKey : ''}`,
+  `GROQ_MODEL=llama-3.3-70b-versatile`,
+  `OPENAI_API_KEY=`,
+  `ANTHROPIC_API_KEY=`,
+  '',
+  `GITHUB_ENABLED=true`,
+  `GITHUB_TOKEN=${githubToken}`,
+  `GITHUB_WEBHOOK_SECRET=${webhookSecret}`,
+  `GITHUB_API_BASE=https://api.github.com`,
+  '',
+  `GITLAB_ENABLED=${gitlabToken ? 'true' : 'false'}`,
+  `GITLAB_TOKEN=${gitlabToken}`,
+  `GITLAB_WEBHOOK_SECRET=${gitlabToken ? webhookSecret : ''}`,
+  `GITLAB_API_BASE=https://gitlab.com/api/v4`,
+  '',
+  `JIRA_ENABLED=${jiraUrl ? 'true' : 'false'}`,
+  `JIRA_BASE_URL=${jiraUrl}`,
+  `JIRA_EMAIL=${jiraEmail}`,
+  `JIRA_API_TOKEN=${jiraApiToken}`,
+  `JIRA_TICKET_REGEX=[A-Z][A-Z0-9]+-\\d+`,
+  '',
+  `NOTIFY_PROVIDER=${teamsUrl ? 'teams' : 'none'}`,
+  `TEAMS_WEBHOOK_URL=${teamsUrl}`,
+  `SLACK_WEBHOOK_URL=`,
+  '',
+  `MAX_DIFF_CHARS=60000`,
+  `CHECK_JIRA_BRANCH=true`,
+  `CHECK_TESTS_ADDED=true`,
+];
+
+fs.writeFileSync(ENV_PATH, envLines.join('\n') + '\n');
+ok('.env file created with your credentials.');
+
+// ─── Step 7: Start the bot server ────────────────────────────────────────────
+hdr('Starting the bot server …');
+const server = spawn('node', ['src/index.js'], {
+  cwd: __dirname,
+  env: { ...process.env },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+
+server.stdout.on('data', (d) => process.stdout.write(DIM + d.toString() + RESET));
+server.stderr.on('data', (d) => process.stderr.write(RED + d.toString() + RESET));
+
+// Give the server 2 seconds to start, then health-check.
+await new Promise((r) => setTimeout(r, 2000));
+
+try {
+  const res = await fetch('http://localhost:3000/health');
+  const json = await res.json();
+  ok(`Server running on port 3000  (AI: ${json.aiProvider}, GitHub: ${json.github})`);
+} catch {
+  err('Server did not respond to /health — check the logs above.');
+  server.kill();
+  process.exit(1);
+}
+
+// ─── Step 8: Start localtunnel ───────────────────────────────────────────────
+hdr('Starting public tunnel (localtunnel) …');
+info('Installing localtunnel (one-time, not saved to project) …');
+
+let ltOutput = '';
+const lt = spawn(
+  process.platform === 'win32' ? 'npx.cmd' : 'npx',
+  ['localtunnel', '--port', '3000'],
+  { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] }
+);
+
+lt.stdout.on('data', (d) => {
+  const chunk = d.toString();
+  ltOutput += chunk;
+});
+lt.stderr.on('data', (d) => process.stderr.write(DIM + d.toString() + RESET));
+
+// Wait up to 20 seconds for the tunnel URL to appear.
+const tunnelUrl = await new Promise((resolve, reject) => {
+  const t = setTimeout(() => reject(new Error('Tunnel URL not received in time')), 20000);
+  const check = setInterval(() => {
+    const m = ltOutput.match(/your url is:\s*(https?:\/\/\S+)/i);
+    if (m) { clearInterval(check); clearTimeout(t); resolve(m[1].trim()); }
+  }, 300);
+});
+
+// ─── Final instructions ───────────────────────────────────────────────────────
+console.log('\n' + '═'.repeat(60));
+console.log(`${BOLD}${GREEN} Setup complete! Here is what to do next:${RESET}`);
+console.log('═'.repeat(60));
+console.log(`
+${BOLD}1. Add the webhook to your GitHub repo:${RESET}
+
+   Go to:  GitHub repo → Settings → Webhooks → Add webhook
+
+   Payload URL:    ${CYAN}${tunnelUrl}/webhook/github${RESET}
+   Content type:   application/json
+   Secret:         ${CYAN}${webhookSecret}${RESET}
+   Events:         Select "Pull requests" only
+
+${BOLD}2. Save the webhook.${RESET} GitHub sends a ping → bot replies pong ✔
+
+${BOLD}3. Open a pull request on that repo.${RESET}
+   Within a few seconds you'll see a bot comment.
+   For the Jira check to pass, name your branch like:
+   ${DIM}feature/PROJ-42-description${RESET}
+
+${BOLD}4. When done testing, press Ctrl+C to stop the server.${RESET}
+   For permanent deployment → see docs/DEPLOYMENT.md
+
+${BOLD}Webhook secret (saved in .env):${RESET}
+${DIM}${webhookSecret}${RESET}
+`);
+
+// Keep the process alive (server + tunnel running).
+process.on('SIGINT', () => {
+  info('Shutting down …');
+  server.kill();
+  lt.kill();
+  process.exit(0);
+});
